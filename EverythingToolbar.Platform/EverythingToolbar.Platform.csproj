@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>EverythingToolbar.Platform</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\EverythingSDK\EverythingSDK.vcxproj" />
+    <ProjectReference Include="..\EverythingSDK3\EverythingSDK3.vcxproj" />
+    <ProjectReference Include="..\EverythingToolbar.Core\EverythingToolbar.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="NLog" />
+    <PackageReference Include="Microsoft.Windows.CsWin32">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <Using Include="EverythingToolbar.Core.Search" />
+  </ItemGroup>
+</Project>

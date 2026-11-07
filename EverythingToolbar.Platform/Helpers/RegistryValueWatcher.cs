@@ -1,0 +1,69 @@
+using System;
+using System.Threading;
+using Microsoft.Win32;
+using NLog;
+using Windows.Win32;
+using Windows.Win32.Foundation;
+using Windows.Win32.System.Registry;
+
+namespace EverythingToolbar.Platform.Helpers
+{
+    public sealed class RegistryValueWatcher : IDisposable
+    {
+        private static readonly ILogger Logger = LogManager.GetCurrentClassLogger();
+
+        private readonly RegistryKey? _key;
+        private readonly AutoResetEvent _changedEvent = new(false);
+        private readonly ManualResetEvent _stopEvent = new(false);
+        private readonly Thread? _thread;
+
+        public event Action? Changed;
+
+        public RegistryValueWatcher(string subKey)
+        {
+            _key = Registry.CurrentUser.OpenSubKey(subKey);
+            if (_key == null)
+            {
+                Logger.Warn("Could not open registry key for watching: {SubKey}", subKey);
+                return;
+            }
+
+            _thread = new Thread(WatchLoop) { IsBackground = true, Name = nameof(RegistryValueWatcher) };
+            _thread.Start();
+        }
+
+        private void WatchLoop()
+        {
+            var handles = new WaitHandle[] { _stopEvent, _changedEvent };
+            while (_key != null)
+            {
+                var result = PInvoke.RegNotifyChangeKeyValue(
+                    (HKEY)_key.Handle.DangerousGetHandle(),
+                    false,
+                    REG_NOTIFY_FILTER.REG_NOTIFY_CHANGE_LAST_SET,
+                    (HANDLE)_changedEvent.SafeWaitHandle.DangerousGetHandle(),
+                    true
+                );
+                if (result != WIN32_ERROR.ERROR_SUCCESS)
+                {
+                    Logger.Warn("RegNotifyChangeKeyValue failed with code {Result}", result);
+                    return;
+                }
+
+                if (WaitHandle.WaitAny(handles) == 0)
+                    return;
+
+                Changed?.Invoke();
+            }
+        }
+
+        public void Dispose()
+        {
+            _stopEvent.Set();
+            _thread?.Join(TimeSpan.FromSeconds(1));
+            _key?.Dispose();
+            _stopEvent.Dispose();
+            _changedEvent.Dispose();
+        }
+    }
+}

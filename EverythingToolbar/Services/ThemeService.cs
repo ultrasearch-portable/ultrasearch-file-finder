@@ -1,0 +1,420 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Threading;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Threading;
+using EverythingToolbar.Helpers;
+using NLog;
+using Windows.UI.ViewManagement;
+using Wpf.Ui.Appearance;
+using Wpf.Ui.Markup;
+using Color = Windows.UI.Color;
+
+namespace EverythingToolbar.Services
+{
+    public enum Theme
+    {
+        Dark,
+        Light,
+    }
+
+    public enum ThemeFlavor
+    {
+        App,
+        System,
+    }
+
+    public enum ThemedSurface
+    {
+        AppWindow,
+
+        TaskbarSurface,
+    }
+
+    public sealed class ThemeChangedEventArgs : EventArgs
+    {
+        public Theme SystemTheme { get; init; }
+        public Theme AppTheme { get; init; }
+    }
+
+    public sealed class ThemeService : IDisposable
+    {
+        private const string PersonalizeSubKey = @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+        private static readonly ILogger Logger = ToolbarLogger.GetLogger<ThemeService>();
+
+        private static readonly RegistryEntry SystemThemeRegistryEntry = new(
+            "HKEY_CURRENT_USER",
+            PersonalizeSubKey,
+            "SystemUsesLightTheme"
+        );
+
+        private static readonly RegistryEntry AppsThemeRegistryEntry = new(
+            "HKEY_CURRENT_USER",
+            PersonalizeSubKey,
+            "AppsUseLightTheme"
+        );
+
+        private static readonly RegistryEntry ColorPrevalenceRegistryEntry = new(
+            "HKEY_CURRENT_USER",
+            PersonalizeSubKey,
+            "ColorPrevalence"
+        );
+
+        private static readonly RegistryEntry StartColorMenuRegistryEntry = new(
+            "HKEY_CURRENT_USER",
+            @"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent",
+            "StartColorMenu"
+        );
+
+        private sealed class Registration
+        {
+            public required WeakReference<FrameworkElement> Root { get; init; }
+            public ThemedSurface Surface { get; init; }
+            public List<ResourceDictionary> AddedDictionaries { get; } = new();
+        }
+
+        private readonly ISettings _settings;
+        private readonly WindowsPolicy _windowsPolicy;
+        private readonly UISettings? _uiSettings;
+        private readonly RegistryValueWatcher? _personalizeWatcher;
+        private readonly Dispatcher _dispatcher;
+        private readonly List<Registration> _registrations = new();
+        private int _applyScheduled;
+
+        public event EventHandler<ThemeChangedEventArgs>? ThemeChanged;
+
+        public ThemeService(ISettings settings, WindowsPolicy windowsPolicy)
+        {
+            _settings = settings;
+            _windowsPolicy = windowsPolicy;
+            _dispatcher = Dispatcher.CurrentDispatcher;
+
+            try
+            {
+                _uiSettings = new UISettings();
+                _uiSettings.ColorValuesChanged += OnColorValuesChanged;
+            }
+            catch
+            {
+                Logger.Info("Could not apply accent color automatically.");
+            }
+
+            _personalizeWatcher = new RegistryValueWatcher(PersonalizeSubKey);
+            _personalizeWatcher.Changed += ScheduleApply;
+
+            _settings.PropertyChanged += OnSettingsChanged;
+        }
+
+        public Theme GetEffectiveTheme(ThemeFlavor flavor)
+        {
+            switch (_settings.ThemeOverride.ToLowerInvariant())
+            {
+                case "light":
+                    return Theme.Light;
+                case "dark":
+                    return Theme.Dark;
+            }
+
+            var entry = flavor == ThemeFlavor.System ? SystemThemeRegistryEntry : AppsThemeRegistryEntry;
+            return (int)(entry.GetValue(0) ?? 0) == 1 ? Theme.Light : Theme.Dark;
+        }
+
+        public bool IsLightTheme() => GetEffectiveTheme(ThemeFlavor.System) == Theme.Light;
+
+        public void Register(FrameworkElement root, ThemedSurface surface)
+        {
+            RemoveRegistration(root);
+            var registration = new Registration { Root = new WeakReference<FrameworkElement>(root), Surface = surface };
+            _registrations.Add(registration);
+
+            var systemTheme = GetEffectiveTheme(ThemeFlavor.System);
+            var appTheme = GetEffectiveTheme(ThemeFlavor.App);
+
+            if (surface == ThemedSurface.AppWindow)
+                ApplyGlobalWpfUiTheme(appTheme);
+
+            ApplyTo(registration, systemTheme);
+        }
+
+        public void Unregister(FrameworkElement root)
+        {
+            RemoveRegistration(root);
+        }
+
+        private void RemoveRegistration(FrameworkElement root)
+        {
+            for (var i = _registrations.Count - 1; i >= 0; i--)
+            {
+                if (!_registrations[i].Root.TryGetTarget(out var target) || ReferenceEquals(target, root))
+                    _registrations.RemoveAt(i);
+            }
+        }
+
+        private void OnColorValuesChanged(UISettings sender, object args) => ScheduleApply();
+
+        // Coalesces bursts from watcher/UISettings background threads into one apply pass on the UI thread.
+        private void ScheduleApply()
+        {
+            if (Interlocked.Exchange(ref _applyScheduled, 1) == 1)
+                return;
+
+            _dispatcher.BeginInvoke(
+                DispatcherPriority.Background,
+                () =>
+                {
+                    Interlocked.Exchange(ref _applyScheduled, 0);
+                    ApplyAll();
+                }
+            );
+        }
+
+        private void OnSettingsChanged(object? sender, PropertyChangedEventArgs e)
+        {
+            if (
+                e.PropertyName
+                is nameof(ISettings.ThemeOverride)
+                    or nameof(ISettings.ForceWin10Behavior)
+                    or nameof(ISettings.SearchWindowBackground)
+                    or nameof(ISettings.SearchWindowBackgroundAlpha)
+                    or nameof(ISettings.SearchWindowBackgroundBrightness)
+            )
+            {
+                ScheduleApply();
+            }
+        }
+
+        private void ApplyAll()
+        {
+            var systemTheme = GetEffectiveTheme(ThemeFlavor.System);
+            var appTheme = GetEffectiveTheme(ThemeFlavor.App);
+            Logger.Debug("Applying theme (system: {system}, app: {app})", systemTheme, appTheme);
+
+            _registrations.RemoveAll(r => !r.Root.TryGetTarget(out _));
+
+            if (_registrations.Any(r => r.Surface == ThemedSurface.AppWindow))
+                ApplyGlobalWpfUiTheme(appTheme);
+
+            foreach (var registration in _registrations)
+            {
+                ApplyTo(registration, systemTheme);
+            }
+
+            ThemeChanged?.Invoke(this, new ThemeChangedEventArgs { SystemTheme = systemTheme, AppTheme = appTheme });
+        }
+
+        private static void ApplyGlobalWpfUiTheme(Theme appTheme) =>
+            ApplicationThemeManager.Apply(appTheme == Theme.Light ? ApplicationTheme.Light : ApplicationTheme.Dark);
+
+        private void ApplyTo(Registration registration, Theme systemTheme)
+        {
+            if (!registration.Root.TryGetTarget(out var root))
+                return;
+
+            switch (registration.Surface)
+            {
+                case ThemedSurface.AppWindow:
+                    ApplicationThemeManager.Apply(root);
+                    break;
+                case ThemedSurface.TaskbarSurface:
+                    ApplyCustomLayers(registration, root, systemTheme);
+                    break;
+            }
+        }
+
+        private void ApplyCustomLayers(Registration registration, FrameworkElement root, Theme systemTheme)
+        {
+            foreach (var dict in registration.AddedDictionaries)
+                root.Resources.MergedDictionaries.Remove(dict);
+            registration.AddedDictionaries.Clear();
+
+            var profile = _windowsPolicy.GetEffectiveWindowsVersion() >= WindowsVersion.Windows11 ? "Win11" : "Win10";
+
+            AddWpfUiBase(registration, root, systemTheme);
+
+            AddResource(registration, root, $"Themes/{profile}/{(systemTheme == Theme.Light ? "Light" : "Dark")}.xaml");
+
+            AddResource(registration, root, $"Themes/{profile}/Controls.xaml");
+
+            AddAccentColor(registration, root, systemTheme);
+
+            AddSearchWindowBackground(registration, root, systemTheme, profile);
+        }
+
+        private static void AddWpfUiBase(Registration registration, FrameworkElement root, Theme theme)
+        {
+            var applicationTheme = theme == Theme.Light ? ApplicationTheme.Light : ApplicationTheme.Dark;
+
+            var controlsDictionary = new ControlsDictionary();
+            var themesDictionary = new ThemesDictionary { Theme = applicationTheme };
+
+            root.Resources.MergedDictionaries.Add(controlsDictionary);
+            root.Resources.MergedDictionaries.Add(themesDictionary);
+
+            registration.AddedDictionaries.Add(controlsDictionary);
+            registration.AddedDictionaries.Add(themesDictionary);
+        }
+
+        private static void AddResource(Registration registration, FrameworkElement root, string relativePath)
+        {
+            var resDict = new ResourceDictionary
+            {
+                Source = new Uri("pack://application:,,,/EverythingToolbar;component/" + relativePath),
+            };
+            root.Resources.MergedDictionaries.Add(resDict);
+            registration.AddedDictionaries.Add(resDict);
+        }
+
+        private void AddAccentColor(Registration registration, FrameworkElement root, Theme systemTheme)
+        {
+            SolidColorBrush brush;
+            if (_uiSettings != null)
+            {
+                var color = _uiSettings.GetColorValue(
+                    systemTheme == Theme.Light ? UIColorType.AccentDark1 : UIColorType.AccentLight2
+                );
+                brush = GetBrush(color);
+            }
+            else
+            {
+                brush = Brushes.DimGray;
+            }
+
+            var resDict = new ResourceDictionary { ["AccentColor"] = brush };
+            root.Resources.MergedDictionaries.Add(resDict);
+            registration.AddedDictionaries.Add(resDict);
+        }
+
+        private static SolidColorBrush GetBrush(Color color) =>
+            ColorHelper.ToFrozenBrush(System.Windows.Media.Color.FromArgb(color.A, color.R, color.G, color.B));
+
+        private void AddSearchWindowBackground(
+            Registration registration,
+            FrameworkElement root,
+            Theme systemTheme,
+            string profile
+        )
+        {
+            var brush = GetSearchWindowBackgroundBrush(systemTheme, profile);
+            var resDict = new ResourceDictionary
+            {
+                ["SearchWindowBackground"] = brush,
+                ["SearchResultsViewHeader"] = brush,
+                ["AcrylicWindowBackgroundFallback"] = System.Windows.Media.Color.FromRgb(
+                    brush.Color.R,
+                    brush.Color.G,
+                    brush.Color.B
+                ),
+            };
+            root.Resources.MergedDictionaries.Add(resDict);
+            registration.AddedDictionaries.Add(resDict);
+        }
+
+        private static readonly SolidColorBrush Win11LightBackgroundBrush = ColorHelper.ToFrozenBrush(
+            System.Windows.Media.Color.FromArgb(0xE0, 0xF5, 0xF5, 0xF5)
+        );
+        private static readonly SolidColorBrush Win10LightBackgroundBrush = ColorHelper.ToFrozenBrush(
+            System.Windows.Media.Color.FromArgb(0xDD, 0xEE, 0xEE, 0xEE)
+        );
+        private static readonly SolidColorBrush Win11DarkBackgroundBrush = ColorHelper.ToFrozenBrush(
+            System.Windows.Media.Color.FromArgb(0xDA, 0x25, 0x25, 0x25)
+        );
+        private static readonly SolidColorBrush Win10DarkBackgroundBrush = ColorHelper.ToFrozenBrush(
+            System.Windows.Media.Color.FromArgb(0xF0, 0x25, 0x25, 0x25)
+        );
+
+        private bool IsTaskbarAccentColorEnabled(Theme systemTheme)
+        {
+            if (systemTheme != Theme.Dark)
+                return false;
+
+            if ((int)(SystemThemeRegistryEntry.GetValue(0) ?? 0) == 1)
+                return false;
+
+            return (int)(ColorPrevalenceRegistryEntry.GetValue(0) ?? 0) != 0;
+        }
+
+        private System.Windows.Media.Color? GetTaskbarAccentColor()
+        {
+            if (_uiSettings != null)
+            {
+                try
+                {
+                    var color = _uiSettings.GetColorValue(UIColorType.AccentDark1);
+                    return System.Windows.Media.Color.FromRgb(color.R, color.G, color.B);
+                }
+                catch (Exception e)
+                {
+                    Logger.Warn(e, "Failed to get taskbar accent color from UISettings.");
+                }
+            }
+
+            try
+            {
+                var val = StartColorMenuRegistryEntry.GetValue(null);
+                if (val is int intVal && intVal != 0)
+                {
+                    byte r = (byte)(intVal & 0xFF);
+                    byte g = (byte)((intVal >> 8) & 0xFF);
+                    byte b = (byte)((intVal >> 16) & 0xFF);
+                    return System.Windows.Media.Color.FromRgb(r, g, b);
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.Warn(e, "Failed to get taskbar accent color from registry.");
+            }
+
+            return null;
+        }
+
+        private SolidColorBrush GetSearchWindowBackgroundBrush(Theme systemTheme, string profile)
+        {
+            if (string.Equals(_settings.SearchWindowBackground, "Custom", StringComparison.OrdinalIgnoreCase))
+            {
+                var color = ColorHelper.GetSearchWindowColor(
+                    _settings.SearchWindowBackgroundAlpha,
+                    _settings.SearchWindowBackgroundBrightness,
+                    systemTheme == Theme.Light
+                );
+                return ColorHelper.ToFrozenBrush(color);
+            }
+
+            // Automatic
+            if (systemTheme == Theme.Light)
+            {
+                return profile == "Win11" ? Win11LightBackgroundBrush : Win10LightBackgroundBrush;
+            }
+
+            if (IsTaskbarAccentColorEnabled(systemTheme))
+            {
+                var accentColor = GetTaskbarAccentColor();
+                if (accentColor.HasValue)
+                {
+                    byte alpha = profile == "Win11" ? (byte)0xDA : (byte)0xF0;
+                    return ColorHelper.ToFrozenBrush(
+                        System.Windows.Media.Color.FromArgb(
+                            alpha,
+                            accentColor.Value.R,
+                            accentColor.Value.G,
+                            accentColor.Value.B
+                        )
+                    );
+                }
+            }
+
+            return profile == "Win11" ? Win11DarkBackgroundBrush : Win10DarkBackgroundBrush;
+        }
+
+        public void Dispose()
+        {
+            _settings.PropertyChanged -= OnSettingsChanged;
+            if (_uiSettings != null)
+                _uiSettings.ColorValuesChanged -= OnColorValuesChanged;
+            _personalizeWatcher?.Dispose();
+        }
+    }
+}

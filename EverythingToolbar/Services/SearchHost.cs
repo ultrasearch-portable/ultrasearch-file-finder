@@ -1,0 +1,90 @@
+using System.Windows;
+using System.Windows.Threading;
+using EverythingToolbar.Behaviors;
+using Microsoft.Xaml.Behaviors;
+
+namespace EverythingToolbar.Services
+{
+    public sealed class SearchHost
+    {
+        private readonly SearchWindowController _controller;
+        private readonly GlobalShortcutListener _shortcutListener;
+        private readonly StartMenuSearchInterceptor _startMenuInterceptor;
+        private readonly SearchWindow _searchWindow;
+        private readonly ISettings _settings;
+        private readonly WindowsPolicy _windowsPolicy;
+
+        private SearchWindowPlacement? _placement;
+        private DispatcherOperation? _preWarmOperation;
+
+        public SearchHost(
+            SearchWindowController controller,
+            GlobalShortcutListener shortcutListener,
+            StartMenuSearchInterceptor startMenuInterceptor,
+            SearchWindow searchWindow,
+            ISettings settings,
+            WindowsPolicy windowsPolicy
+        )
+        {
+            _controller = controller;
+            _shortcutListener = shortcutListener;
+            _startMenuInterceptor = startMenuInterceptor;
+            _searchWindow = searchWindow;
+            _settings = settings;
+            _windowsPolicy = windowsPolicy;
+        }
+
+        public void Attach(FrameworkElement? placementTarget, bool iconMode)
+        {
+            if (_placement != null)
+                Detach();
+
+            _controller.SetIconMode(iconMode);
+            _shortcutListener.Initialize(_controller.ToggleSearchUi);
+            _startMenuInterceptor.Initialize(placementTarget != null ? ShowSearchUiAtToolbar : ShowSearchUiStandalone);
+
+            _placement = new SearchWindowPlacement(_settings, _windowsPolicy) { PlacementTarget = placementTarget };
+            Interaction.GetBehaviors(_searchWindow).Add(_placement);
+
+            _preWarmOperation = _searchWindow.Dispatcher.BeginInvoke(
+                _controller.PreWarm,
+                DispatcherPriority.ApplicationIdle
+            );
+        }
+
+        private void ShowSearchUiAtToolbar()
+        {
+            _controller.Show();
+            _controller.FocusSearchBox();
+        }
+
+        private void ShowSearchUiStandalone()
+        {
+            _controller.ShowStandalone();
+            _controller.FocusSearchBox();
+        }
+
+        public void SetPlacementTarget(FrameworkElement? target)
+        {
+            if (_placement != null)
+                _placement.PlacementTarget = target;
+        }
+
+        public void Detach()
+        {
+            _preWarmOperation?.Abort();
+            _preWarmOperation = null;
+
+            _shortcutListener.Disable();
+            _startMenuInterceptor.Disable();
+
+            _controller.Hide();
+
+            if (_placement != null)
+            {
+                Interaction.GetBehaviors(_searchWindow).Remove(_placement);
+                _placement = null;
+            }
+        }
+    }
+}
